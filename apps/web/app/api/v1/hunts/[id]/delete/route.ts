@@ -1,11 +1,12 @@
+import { huntDeleteBodySchema } from "@hunty/types/api-schemas";
 import { NextResponse } from "next/server";
-import { rateLimit, getIP, rateLimitResponse } from "@/lib/rate-limit";
-import { logger } from "@/lib/logger";
+import { z } from "zod";
+
 import { ValidationError } from "@/lib/api/errors";
 import { withValidation } from "@/lib/api/withValidation";
 import { recordHuntAudit } from "@/lib/db/huntAuditLog";
-import { huntDeleteBodySchema } from "@hunty/types/api-schemas";
-import { z } from "zod";
+import { logger } from "@/lib/logger";
+import { getIP, rateLimit, rateLimitPresets, rateLimitResponse } from "@/lib/rate-limit";
 
 const paramsSchema = z.object({ id: z.string() })
 
@@ -17,7 +18,7 @@ export const POST = withValidation(
   { body: huntDeleteBodySchema, params: paramsSchema },
   async (req, _context, { body, params }) => {
     const ip = getIP(req);
-    const { success, reset } = await rateLimit(ip, { limit: 30, windowMs: 60 * 1000 });
+    const { success, reset } = await rateLimit(ip, rateLimitPresets.write);
     if (!success) return rateLimitResponse(reset);
 
     const huntId = parseInt(params!.id, 10);
@@ -25,7 +26,27 @@ export const POST = withValidation(
       throw new ValidationError("Invalid hunt ID", { id: params!.id });
     }
 
-    const actorAddress = body!.actorAddress;
+    const authResult = await verifyCallerAuth(req as unknown as NextRequest, body);
+    if (!authResult.authenticated) {
+      return NextResponse.json({ error: authResult.error }, { status: 401 });
+    }
+    if (!authResult.authorized || !authResult.actor) {
+      return NextResponse.json({ error: authResult.error }, { status: 403 });
+    }
+
+    const actorAddress = authResult.actor;
+
+    const hunt = getHuntById(huntId);
+    if (!hunt) {
+      return NextResponse.json({ error: "Hunt not found" }, { status: 404 });
+    }
+
+    const isAdmin = actorAddress.startsWith("sess_") || actorAddress === "session_authenticated_admin";
+    const isCreator = hunt.creator === actorAddress || hunt.ownerAddress === actorAddress;
+    
+    if (!isAdmin && !isCreator) {
+      return NextResponse.json({ error: "Forbidden: only the creator can delete this hunt" }, { status: 403 });
+    }
 
     try {
       if (body.action === "soft-delete") {
